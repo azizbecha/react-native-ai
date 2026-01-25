@@ -37,18 +37,18 @@
     "prepare": "bob build"
   },
   "dependencies": {
-    "@ai-sdk/provider": "^2.0.0",
-    "@ai-sdk/provider-utils": "^3.0.10",
+    "@ai-sdk/provider": "^3.0.5",
+    "@ai-sdk/provider-utils": "^4.0.1",
     "react-native-blob-util": "^0.24.5",
     "zod": "^4.0.0"
   },
   "peerDependencies": {
     "react-native": ">=0.76.0",
-    "llama.rn": "^0.10.0-rc.0"
+    "llama.rn": "^0.10.1"
   },
   "devDependencies": {
     "react-native": "0.81.4",
-    "llama.rn": "^0.10.0-rc.0"
+    "llama.rn": "^0.10.1"
   },
   "react-native-builder-bob": {
     "source": "src",

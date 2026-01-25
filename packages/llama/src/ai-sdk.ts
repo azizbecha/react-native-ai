@@ -1,13 +1,17 @@
 import type {
-  EmbeddingModelV2,
-  LanguageModelV2,
-  LanguageModelV2CallOptions,
-  LanguageModelV2Content,
-  LanguageModelV2FinishReason,
-  LanguageModelV2Prompt,
-  LanguageModelV2StreamPart,
-  SpeechModelV2,
-  SpeechModelV2CallOptions,
+  EmbeddingModelV3,
+  EmbeddingModelV3CallOptions,
+  EmbeddingModelV3Result,
+  LanguageModelV3,
+  LanguageModelV3CallOptions,
+  LanguageModelV3Content,
+  LanguageModelV3FinishReason,
+  LanguageModelV3Prompt,
+  LanguageModelV3StreamPart,
+  RerankingModelV3,
+  RerankingModelV3CallOptions,
+  SpeechModelV3,
+  SpeechModelV3CallOptions,
 } from '@ai-sdk/provider'
 import { generateId } from '@ai-sdk/provider-utils'
 import {
@@ -18,38 +22,50 @@ import {
   type LlamaContext,
   type NativeCompletionResult,
   type NativeEmbeddingResult,
-  type RNLlamaOAICompatibleMessage,
   type TokenData,
 } from 'llama.rn'
 
-import {
-  downloadModel,
-  type DownloadProgress,
-  getDownloadedModels,
-  getModelPath,
-  isModelDownloaded,
-  type ModelInfo,
-  removeModel as removeModelFromStorage,
-  setStoragePath,
-} from './storage'
+type LLMState = 'text' | 'reasoning' | 'tool-call' | 'none'
 
-export type { DownloadProgress, ModelInfo }
+interface LLMMessagePart {
+  type: 'text' | 'image_url' | 'input_audio'
+  text?: string
+  image_url?: { url: string }
+  input_audio?:
+    | { format: string; data: string }
+    | { format: string; url: string }
+}
 
-type LLMState = 'text' | 'reasoning' | 'none'
+// Taken from https://github.com/mybigday/llama.rn/blob/main/example/src/utils/llmMessages.ts
+interface LLMMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string | LLMMessagePart[]
+  reasoning_content?: string
+  tool_call_id?: string
+  tool_calls?: any[]
+}
 
 function convertFinishReason(
   result: NativeCompletionResult
-): LanguageModelV2FinishReason {
+): LanguageModelV3FinishReason {
+  let unified: LanguageModelV3FinishReason['unified'] = 'other'
+  let raw: string | undefined
+
   if (result.stopped_eos) {
-    return 'stop'
+    unified = 'stop'
+    raw = 'stopped_eos'
+  } else if (result.stopped_word) {
+    unified = 'stop'
+    raw = 'stopped_word'
+  } else if (result.stopped_limit) {
+    unified = 'length'
+    raw = 'stopped_limit'
   }
-  if (result.stopped_word) {
-    return 'stop'
+
+  return {
+    unified,
+    raw,
   }
-  if (result.stopped_limit) {
-    return 'length'
-  }
-  return 'unknown'
 }
 
 /**
@@ -74,78 +90,138 @@ function uint8ArrayToBase64(bytes: Uint8Array): string {
  *
  * @see https://github.com/mybigday/llama.rn#multimodal-vision--audio
  */
-function prepareMessagesWithMedia(prompt: LanguageModelV2Prompt): {
-  messages: RNLlamaOAICompatibleMessage[]
-} {
-  const messages: RNLlamaOAICompatibleMessage[] = []
+function prepareMessagesWithMedia(prompt: LanguageModelV3Prompt): LLMMessage[] {
+  const messages: LLMMessage[] = []
 
-  for (const message of prompt) {
-    // String content - push directly
-    if (typeof message.content === 'string') {
-      messages.push({ role: message.role, content: message.content })
-      continue
+  type PromptPart = Extract<
+    LanguageModelV3Prompt[number],
+    { content: unknown[] }
+  >['content'][number]
+
+  const convertFilePartToMedia = (
+    part: Extract<PromptPart, { type: 'file' }>
+  ): LLMMessagePart => {
+    const mediaType = part.mediaType.toLowerCase()
+    const data = part.data as unknown
+
+    const url =
+      data instanceof Uint8Array
+        ? `data:${part.mediaType};base64,${uint8ArrayToBase64(data)}`
+        : data instanceof URL
+          ? data.toString()
+          : typeof data === 'string'
+            ? data
+            : null
+
+    if (!url) {
+      return { type: 'text', text: '' }
     }
 
-    // Non-array content - skip
-    if (!Array.isArray(message.content)) {
-      continue
+    if (mediaType.startsWith('image/')) {
+      return { type: 'image_url', image_url: { url } }
     }
 
-    // Process array content parts
-    const parts: RNLlamaOAICompatibleMessage['content'] = []
-
-    for (const part of message.content) {
-      switch (part.type) {
-        case 'text':
-          parts.push({ type: 'text', text: part.text })
-          break
-
-        case 'file': {
-          const mediaType = part.mediaType.toLowerCase()
-          const { data } = part
-
-          // Convert data to URL string
-          const url =
-            data instanceof Uint8Array
-              ? `data:${part.mediaType};base64,${uint8ArrayToBase64(data)}`
-              : data instanceof URL
-                ? data.toString()
-                : typeof data === 'string'
-                  ? data
-                  : null
-
-          if (!url) break
-
-          // Handle images
-          if (mediaType.startsWith('image/')) {
-            parts.push({ type: 'image_url', image_url: { url } })
-            break
-          }
-
-          // Handle audio
-          if (mediaType.startsWith('audio/')) {
-            const format = mediaType.includes('wav') ? 'wav' : 'mp3'
-            const isDataUrl = url.startsWith('data:')
-            parts.push({
-              type: 'input_audio',
-              input_audio: {
-                format,
-                data: isDataUrl ? url : undefined,
-                url: isDataUrl ? undefined : url,
-              },
-            })
-          }
-          break
+    if (mediaType.startsWith('audio/')) {
+      const format = mediaType.includes('wav') ? 'wav' : 'mp3'
+      if (url.startsWith('data:')) {
+        return {
+          type: 'input_audio',
+          input_audio: {
+            format,
+            data: url,
+          },
         }
+      }
+      return {
+        type: 'input_audio',
+        input_audio: {
+          format,
+          url,
+        },
       }
     }
 
-    if (parts.length > 0) {
-      messages.push({ role: message.role, content: parts })
+    return { type: 'text', text: '' }
+  }
+
+  for (const message of prompt) {
+    switch (message.role) {
+      case 'system':
+      case 'user':
+        if (typeof message.content === 'string') {
+          messages.push({ role: message.role, content: message.content })
+        } else {
+          for (const part of message.content) {
+            switch (part.type) {
+              case 'text':
+                messages.push({ role: message.role, content: part.text })
+                break
+              case 'file':
+                messages.push({
+                  role: message.role,
+                  content: [convertFilePartToMedia(part)],
+                })
+                break
+              default:
+                throw new Error(
+                  `Unsupported message content type: ${JSON.stringify(part)}`
+                )
+            }
+          }
+        }
+        break
+      case 'assistant': {
+        const reasoningContent = message.content.find(
+          (part) => part.type === 'reasoning'
+        )
+        const toolCalls = message.content.filter(
+          (part) => part.type === 'tool-call'
+        )
+        const content = message.content.filter((part) => part.type === 'text')
+        messages.push({
+          role: 'assistant',
+          content,
+          reasoning_content: reasoningContent?.text,
+          tool_calls: toolCalls.map((toolCall) => ({
+            type: 'function',
+            id: toolCall.toolCallId,
+            function: {
+              name: toolCall.toolName,
+              arguments: JSON.stringify(toolCall.input),
+            },
+          })),
+        })
+        const toolResults = message.content.filter(
+          (part) => part.type === 'tool-result'
+        )
+        if (toolResults.length > 0) {
+          console.warn(
+            '[llama] Model executed tools are not supported. Skipping:',
+            toolResults
+          )
+        }
+        break
+      }
+      case 'tool': {
+        const toolResults = message.content.filter(
+          (part) => part.type === 'tool-result'
+        )
+        for (const toolResult of toolResults) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolResult.toolCallId,
+            content:
+              toolResult.output.type === 'execution-denied'
+                ? (toolResult.output.reason ?? 'Execution denied')
+                : JSON.stringify(toolResult.output.value),
+          })
+        }
+        break
+      }
     }
   }
 
-  return { messages }
+  return messages
 }
 
 /**
@@ -171,35 +247,11 @@ export interface LlamaModelOptions {
   contextParams?: Partial<ContextParams>
 }
 
-/**
- * Engine for managing llama.rn models (similar to MLCEngine)
- */
-export const LlamaEngine = {
-  /**
-   * Get all downloaded models
-   */
-  getModels: (): Promise<ModelInfo[]> => {
-    return getDownloadedModels()
-  },
-
-  /**
-   * Check if a specific model is downloaded
-   */
-  isDownloaded: (modelId: string): Promise<boolean> => {
-    return isModelDownloaded(modelId)
-  },
-
-  /**
-   * Set custom storage path for models
-   * Default: ${DocumentDir}/llama-models/
-   */
-  setStoragePath: (path: string): void => {
-    setStoragePath(path)
-  },
-}
-
 const START_OF_THINKING_PLACEHOLDER = '<think>'
 const END_OF_THINKING_PLACEHOLDER = '</think>'
+
+const START_OF_TOOL_CALL_PLACEHOLDER = '<tool_call>'
+const END_OF_TOOL_CALL_PLACEHOLDER = '</tool_call>'
 
 /**
  * llama.rn Language Model for AI SDK
@@ -208,11 +260,12 @@ const END_OF_THINKING_PLACEHOLDER = '</think>'
  *
  * @see https://github.com/mybigday/llama.rn
  */
-export class LlamaLanguageModel implements LanguageModelV2 {
-  readonly specificationVersion = 'v2'
+export class LlamaLanguageModel implements LanguageModelV3 {
+  readonly specificationVersion = 'v3'
   readonly provider = 'llama'
   readonly modelId: string
 
+  private modelPath: string
   private options: LlamaModelOptions
   private context: LlamaContext | null = null
   private multimodalInitialized: boolean = false
@@ -231,8 +284,13 @@ export class LlamaLanguageModel implements LanguageModelV2 {
     return {}
   }
 
-  constructor(modelId: string, options: LlamaModelOptions = {}) {
-    this.modelId = modelId
+  /**
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
+  constructor(modelPath: string, options: LlamaModelOptions = {}) {
+    this.modelPath = modelPath
+    this.modelId = modelPath
 
     this.options = {
       projectorUseGpu: true,
@@ -246,40 +304,16 @@ export class LlamaLanguageModel implements LanguageModelV2 {
   }
 
   /**
-   * Check if model is downloaded
-   */
-  async isDownloaded(): Promise<boolean> {
-    return isModelDownloaded(this.modelId)
-  }
-
-  /**
-   * Download model from HuggingFace
-   */
-  async download(
-    progressCallback?: (progress: DownloadProgress) => void
-  ): Promise<void> {
-    await downloadModel(this.modelId, progressCallback)
-  }
-
-  /**
    * Initialize the model (load LlamaContext)
+   * @returns The initialized LlamaContext
    */
-  async prepare(): Promise<void> {
+  async prepare(): Promise<LlamaContext> {
     if (this.context) {
-      return
-    }
-
-    const modelPath = getModelPath(this.modelId)
-    const exists = await isModelDownloaded(this.modelId)
-
-    if (!exists) {
-      throw new Error(
-        `Model not downloaded. Call download() first. Model ID: ${this.modelId}`
-      )
+      return this.context
     }
 
     this.context = await initLlama({
-      model: modelPath,
+      model: this.modelPath,
       // Important: ctx_shift must be false for multimodal (required per docs)
       ...(this.options.projectorPath ? { ctx_shift: false } : {}),
       ...this.options.contextParams,
@@ -289,6 +323,8 @@ export class LlamaLanguageModel implements LanguageModelV2 {
     if (this.options.projectorPath) {
       await this.initializeMultimodal()
     }
+
+    return this.context
   }
 
   /**
@@ -337,22 +373,18 @@ export class LlamaLanguageModel implements LanguageModelV2 {
   }
 
   /**
-   * Remove model from disk
+   * Non-streaming text generation (AI SDK LanguageModelV3)
    */
-  async remove(): Promise<void> {
-    await this.unload()
-    await removeModelFromStorage(this.modelId)
-  }
-
-  /**
-   * Non-streaming text generation (AI SDK LanguageModelV2)
-   */
-  async doGenerate(options: LanguageModelV2CallOptions) {
+  async doGenerate(options: LanguageModelV3CallOptions) {
     if (!this.context) {
-      throw new Error('Model not prepared. Call prepare() first.')
+      console.warn(
+        '[llama] Model not prepared. Call prepare() ahead of time to optimize performance.'
+      )
     }
 
-    const { messages } = prepareMessagesWithMedia(options.prompt)
+    const context = this.context ?? (await this.prepare())
+
+    const messages = prepareMessagesWithMedia(options.prompt)
 
     const completionOptions: Partial<CompletionParams> = {
       messages,
@@ -364,6 +396,7 @@ export class LlamaLanguageModel implements LanguageModelV2 {
       penalty_freq: options.frequencyPenalty,
       stop: options.stopSequences,
       seed: options.seed,
+      reasoning_format: 'auto',
     }
 
     if (options.responseFormat?.type === 'json') {
@@ -373,42 +406,60 @@ export class LlamaLanguageModel implements LanguageModelV2 {
       }
     }
 
-    const response = await this.context.completion(completionOptions)
-    let textContent = response.content
+    if (options.tools) {
+      completionOptions.tools = options.tools.map(({ type, ...tool }) => ({
+        type,
+        function: tool,
+      }))
+      completionOptions.tool_choice = options.toolChoice?.type ?? 'auto'
+    }
 
-    // filter out thinking tags from content
-    const thinkingStartIndex = textContent.indexOf(
-      START_OF_THINKING_PLACEHOLDER
-    )
-    const thinkingEndIndex = textContent.indexOf(END_OF_THINKING_PLACEHOLDER)
+    const response = await context.completion(completionOptions)
+    let content: LanguageModelV3Content[] = []
 
-    if (thinkingStartIndex !== -1 && thinkingEndIndex !== -1) {
-      // remove reasoning block from text content
-      const beforeThinking = textContent.slice(0, thinkingStartIndex)
-      const afterThinking = textContent.slice(
-        thinkingEndIndex + END_OF_THINKING_PLACEHOLDER.length
+    if (response.content) {
+      content.push({
+        type: 'text',
+        text: response.content,
+      })
+    }
+
+    if (response.reasoning_content) {
+      content.push({
+        type: 'reasoning',
+        text: response.reasoning_content,
+      })
+    }
+
+    if (response.tool_calls) {
+      content.push(
+        ...response.tool_calls.map((toolCall) => ({
+          type: 'tool-call' as const,
+          toolCallId: toolCall.id ?? generateId(),
+          toolName: toolCall.function.name,
+          input: toolCall.function.arguments,
+        }))
       )
-      textContent = beforeThinking + afterThinking
     }
 
     return {
-      content: [
-        {
-          type: 'text',
-          text: textContent,
-        },
-        {
-          type: 'reasoning',
-          text: response.reasoning_content,
-        },
-      ] as LanguageModelV2Content[],
-      finishReason: convertFinishReason(response),
+      content,
+      finishReason:
+        response.tool_calls?.length > 0
+          ? { unified: 'tool-calls' as const, raw: 'tool-calls' }
+          : convertFinishReason(response),
       usage: {
-        inputTokens: response.timings?.prompt_n || 0,
-        outputTokens: response.timings?.predicted_n || 0,
-        totalTokens:
-          (response.timings?.prompt_n || 0) +
-          (response.timings?.predicted_n || 0),
+        inputTokens: {
+          total: response.timings?.prompt_n || 0,
+          noCache: undefined,
+          cacheRead: undefined,
+          cacheWrite: undefined,
+        },
+        outputTokens: {
+          total: response.timings?.predicted_n || 0,
+          text: undefined,
+          reasoning: undefined,
+        },
       },
       providerMetadata: {
         llama: {
@@ -420,11 +471,13 @@ export class LlamaLanguageModel implements LanguageModelV2 {
   }
 
   /**
-   * Streaming text generation (AI SDK LanguageModelV2)
+   * Streaming text generation (AI SDK LanguageModelV3)
    */
-  async doStream(options: LanguageModelV2CallOptions) {
+  async doStream(options: LanguageModelV3CallOptions) {
     if (!this.context) {
-      throw new Error('Model not prepared. Call prepare() first.')
+      console.warn(
+        '[llama] Model not prepared. Call prepare() ahead of time to optimize performance.'
+      )
     }
 
     if (typeof ReadableStream === 'undefined') {
@@ -433,7 +486,9 @@ export class LlamaLanguageModel implements LanguageModelV2 {
       )
     }
 
-    const { messages } = prepareMessagesWithMedia(options.prompt)
+    const context = this.context ?? (await this.prepare())
+
+    const messages = prepareMessagesWithMedia(options.prompt)
 
     const completionOptions: Partial<CompletionParams> = {
       messages,
@@ -447,6 +502,14 @@ export class LlamaLanguageModel implements LanguageModelV2 {
       seed: options.seed,
     }
 
+    if (options.tools) {
+      completionOptions.tools = options.tools.map(({ type, ...tool }) => ({
+        type,
+        function: tool,
+      }))
+      completionOptions.tool_choice = options.toolChoice?.type ?? 'auto'
+    }
+
     if (options.responseFormat?.type === 'json') {
       completionOptions.response_format = {
         type: 'json_object',
@@ -454,12 +517,10 @@ export class LlamaLanguageModel implements LanguageModelV2 {
       }
     }
 
-    const context = this.context
-
-    const stream = new ReadableStream<LanguageModelV2StreamPart>({
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
       start: async (controller) => {
         try {
-          let textId = generateId()
+          let currentChunkId = generateId()
 
           let state: LLMState = 'none' as LLMState
 
@@ -468,109 +529,121 @@ export class LlamaLanguageModel implements LanguageModelV2 {
             warnings: [],
           })
 
+          const finishCurrentBlock = () => {
+            if (state === 'text') {
+              controller.enqueue({
+                type: 'text-end',
+                id: currentChunkId,
+              })
+            }
+            if (state === 'reasoning') {
+              controller.enqueue({
+                type: 'reasoning-end',
+                id: currentChunkId,
+              })
+            }
+            state = 'none'
+          }
+
           const result = await context.completion(
             completionOptions,
             (tokenData: TokenData) => {
               const { token } = tokenData
 
               switch (token) {
-                case START_OF_THINKING_PLACEHOLDER:
-                  // start reasoning block
-                  if (state === 'text') {
-                    // finish text block
-                    controller.enqueue({
-                      type: 'text-end',
-                      id: textId,
-                    })
-                  }
-
+                case START_OF_THINKING_PLACEHOLDER: {
+                  finishCurrentBlock()
                   state = 'reasoning'
-                  textId = generateId()
-
+                  currentChunkId = generateId()
                   controller.enqueue({
                     type: 'reasoning-start',
-                    id: textId,
+                    id: currentChunkId,
                   })
                   break
-
-                case END_OF_THINKING_PLACEHOLDER:
-                  // finish reasoning block
-                  if (state === 'reasoning') {
+                }
+                case START_OF_TOOL_CALL_PLACEHOLDER: {
+                  finishCurrentBlock()
+                  state = 'tool-call'
+                  break
+                }
+                case END_OF_TOOL_CALL_PLACEHOLDER: {
+                  finishCurrentBlock()
+                  for (const toolCall of tokenData.tool_calls ?? []) {
                     controller.enqueue({
-                      type: 'reasoning-end',
-                      id: textId,
+                      type: 'tool-call',
+                      toolCallId: toolCall.id ?? generateId(),
+                      toolName: toolCall.function.name,
+                      input: toolCall.function.arguments,
                     })
                   }
-
-                  state = 'none'
                   break
-
+                }
+                case END_OF_THINKING_PLACEHOLDER: {
+                  finishCurrentBlock()
+                  break
+                }
                 default:
-                  // process regular token
-
                   switch (state) {
-                    case 'none':
-                      // start text block
+                    case 'none': {
                       state = 'text'
-                      textId = generateId()
+                      currentChunkId = generateId()
                       controller.enqueue({
                         type: 'text-start',
-                        id: textId,
+                        id: currentChunkId,
                       })
                       controller.enqueue({
                         type: 'text-delta',
-                        id: textId,
+                        id: currentChunkId,
                         delta: token,
                       })
                       break
-
-                    case 'text':
-                      // continue text block
+                    }
+                    case 'text': {
                       controller.enqueue({
                         type: 'text-delta',
-                        id: textId,
+                        id: currentChunkId,
                         delta: token,
                       })
                       break
-
-                    case 'reasoning':
-                      // continue reasoning block
+                    }
+                    case 'reasoning': {
                       controller.enqueue({
                         type: 'reasoning-delta',
-                        id: textId,
+                        id: currentChunkId,
                         delta: token,
                       })
                       break
+                    }
+                    case 'tool-call': {
+                      // Ignore tokens while in tool-call state; tool call data
+                      // is handled via tokenData.tool_calls at the end marker.
+                      break
+                    }
                   }
               }
             }
           )
 
-          if (state === 'text') {
-            // finish text block
-            controller.enqueue({
-              type: 'text-end',
-              id: textId,
-            })
-          }
-
-          if (state === 'reasoning') {
-            // finish reasoning block
-            controller.enqueue({
-              type: 'reasoning-end',
-              id: textId,
-            })
-          }
+          finishCurrentBlock()
 
           controller.enqueue({
             type: 'finish',
-            finishReason: convertFinishReason(result),
+            finishReason:
+              result.tool_calls?.length > 0
+                ? { unified: 'tool-calls' as const, raw: 'tool-calls' }
+                : convertFinishReason(result),
             usage: {
-              inputTokens: result.timings?.prompt_n || 0,
-              outputTokens: result.timings?.predicted_n || 0,
-              totalTokens:
-                (result.timings?.prompt_n || 0) +
-                (result.timings?.predicted_n || 0),
+              inputTokens: {
+                total: result.timings?.prompt_n || 0,
+                noCache: undefined,
+                cacheRead: undefined,
+                cacheWrite: undefined,
+              },
+              outputTokens: {
+                total: result.timings?.predicted_n || 0,
+                text: undefined,
+                reasoning: undefined,
+              },
             },
             providerMetadata: {
               llama: {
@@ -613,8 +686,8 @@ export interface LlamaEmbeddingOptions {
 /**
  * llama.rn Embedding Model for AI SDK
  */
-export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
-  readonly specificationVersion = 'v2'
+export class LlamaEmbeddingModel implements EmbeddingModelV3 {
+  readonly specificationVersion = 'v3'
   readonly provider = 'llama'
   readonly modelId: string
 
@@ -625,11 +698,17 @@ export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
     return this.maxEmbeddingsPerCall > 0
   }
 
+  private modelPath: string
   private options: LlamaEmbeddingOptions
   private context: LlamaContext | null = null
 
-  constructor(modelId: string, options: LlamaEmbeddingOptions = {}) {
-    this.modelId = modelId
+  /**
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
+  constructor(modelPath: string, options: LlamaEmbeddingOptions = {}) {
+    this.modelPath = modelPath
+    this.modelId = modelPath
     this.options = {
       normalize: -1,
       ...options,
@@ -645,42 +724,20 @@ export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
   }
 
   /**
-   * Check if model is downloaded
-   */
-  async isDownloaded(): Promise<boolean> {
-    return isModelDownloaded(this.modelId)
-  }
-
-  /**
-   * Download model from HuggingFace
-   */
-  async download(
-    progressCallback?: (progress: DownloadProgress) => void
-  ): Promise<void> {
-    await downloadModel(this.modelId, progressCallback)
-  }
-
-  /**
    * Initialize the model (load LlamaContext with embedding enabled)
+   * @returns The initialized LlamaContext
    */
-  async prepare(): Promise<void> {
+  async prepare(): Promise<LlamaContext> {
     if (this.context) {
-      return
-    }
-
-    const modelPath = getModelPath(this.modelId)
-    const exists = await isModelDownloaded(this.modelId)
-
-    if (!exists) {
-      throw new Error(
-        `Model not downloaded. Call download() first. Model ID: ${this.modelId}`
-      )
+      return this.context
     }
 
     this.context = await initLlama({
-      model: modelPath,
+      model: this.modelPath,
       ...this.options.contextParams,
     })
+
+    return this.context
   }
 
   /**
@@ -701,24 +758,18 @@ export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
   }
 
   /**
-   * Remove model from disk
+   * Generate embeddings (AI SDK EmbeddingModelV3)
    */
-  async remove(): Promise<void> {
-    await this.unload()
-    await removeModelFromStorage(this.modelId)
-  }
-
-  /**
-   * Generate embeddings (AI SDK EmbeddingModelV2)
-   */
-  async doEmbed(options: {
-    values: string[]
-    abortSignal?: AbortSignal
-    headers?: Record<string, string | undefined>
-  }) {
+  async doEmbed(
+    options: EmbeddingModelV3CallOptions
+  ): Promise<EmbeddingModelV3Result> {
     if (!this.context) {
-      throw new Error('Model not prepared. Call prepare() first.')
+      console.warn(
+        '[llama] Model not prepared. Call prepare() ahead of time to optimize performance.'
+      )
     }
+
+    const context = this.context ?? (await this.prepare())
 
     const embeddings: number[][] = []
     const embeddingParams: EmbeddingParams = {
@@ -731,7 +782,7 @@ export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
         throw new Error('Embedding generation was aborted')
       }
 
-      const result: NativeEmbeddingResult = await this.context.embedding(
+      const result: NativeEmbeddingResult = await context.embedding(
         value,
         embeddingParams
       )
@@ -743,6 +794,128 @@ export class LlamaEmbeddingModel implements EmbeddingModelV2<string> {
       usage: {
         tokens: options.values.reduce((acc, val) => acc + val.length, 0),
       },
+      warnings: [],
+    }
+  }
+}
+
+export interface LlamaRerankOptions {
+  /**
+   * Normalize scores (default: from model config)
+   */
+  normalize?: number
+  /**
+   * llama.rn context params passed to initLlama()
+   */
+  contextParams?: Partial<ContextParams>
+}
+
+/**
+ * llama.rn Rerank Model for AI SDK
+ *
+ * Ranks documents based on their relevance to a query.
+ * Useful for improving search results and implementing RAG systems.
+ *
+ * @see https://github.com/mybigday/llama.rn
+ */
+export class LlamaRerankModel implements RerankingModelV3 {
+  readonly specificationVersion = 'v3'
+  readonly provider = 'llama'
+  readonly modelId: string
+
+  private modelPath: string
+  private options: LlamaRerankOptions
+  private context: LlamaContext | null = null
+
+  /**
+   * @param modelPath - Path to the reranker model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
+  constructor(modelPath: string, options: LlamaRerankOptions = {}) {
+    this.modelPath = modelPath
+    this.modelId = modelPath
+    this.options = {
+      normalize: options.normalize,
+      ...options,
+      contextParams: {
+        n_ctx: 2048,
+        n_gpu_layers: 99,
+        embedding: true,
+        pooling_type: 'rank',
+        ...options.contextParams,
+      },
+    }
+  }
+
+  /**
+   * Initialize the model (load LlamaContext with rank pooling enabled)
+   * @returns The initialized LlamaContext
+   */
+  async prepare(): Promise<LlamaContext> {
+    if (this.context) {
+      return this.context
+    }
+
+    this.context = await initLlama({
+      model: this.modelPath,
+      ...this.options.contextParams,
+    })
+
+    return this.context
+  }
+
+  /**
+   * Get the underlying LlamaContext (for advanced usage)
+   */
+  getContext(): LlamaContext | null {
+    return this.context
+  }
+
+  /**
+   * Unload model from memory
+   */
+  async unload(): Promise<void> {
+    if (this.context) {
+      await this.context.release()
+      this.context = null
+    }
+  }
+
+  /**
+   * Rerank documents based on relevance to query (AI SDK RerankingModelV3)
+   */
+  async doRerank(options: RerankingModelV3CallOptions) {
+    if (!this.context) {
+      console.warn(
+        '[llama] Model not prepared. Call prepare() ahead of time to optimize performance.'
+      )
+    }
+
+    const context = this.context ?? (await this.prepare())
+
+    // Convert documents to string array for llama.rn
+    const documentStrings =
+      options.documents.type === 'text'
+        ? options.documents.values
+        : options.documents.values.map((doc) => JSON.stringify(doc))
+
+    const results = await context.rerank(options.query, documentStrings, {
+      normalize: this.options.normalize,
+    })
+
+    // Map to AI SDK V3 format
+    let ranking = results.map((result) => ({
+      index: result.index,
+      relevanceScore: result.score,
+    }))
+
+    // Apply topN filter if specified
+    if (options.topN !== undefined && options.topN > 0) {
+      ranking = ranking.slice(0, options.topN)
+    }
+
+    return {
+      ranking,
     }
   }
 }
@@ -762,17 +935,23 @@ export interface LlamaSpeechOptions {
 /**
  * llama.rn Speech Model for AI SDK (using vocoder for TTS)
  */
-export class LlamaSpeechModel implements SpeechModelV2 {
-  readonly specificationVersion = 'v2'
+export class LlamaSpeechModel implements SpeechModelV3 {
+  readonly specificationVersion = 'v3'
   readonly provider = 'llama'
   readonly modelId: string
 
+  private modelPath: string
   private options: LlamaSpeechOptions
   private context: LlamaContext | null = null
   private vocoderInitialized: boolean = false
 
-  constructor(modelId: string, options: LlamaSpeechOptions = {}) {
-    this.modelId = modelId
+  /**
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
+  constructor(modelPath: string, options: LlamaSpeechOptions = {}) {
+    this.modelPath = modelPath
+    this.modelId = modelPath
     this.options = {
       ...options,
       contextParams: {
@@ -784,40 +963,16 @@ export class LlamaSpeechModel implements SpeechModelV2 {
   }
 
   /**
-   * Check if model is downloaded
-   */
-  async isDownloaded(): Promise<boolean> {
-    return isModelDownloaded(this.modelId)
-  }
-
-  /**
-   * Download model from HuggingFace
-   */
-  async download(
-    progressCallback?: (progress: DownloadProgress) => void
-  ): Promise<void> {
-    await downloadModel(this.modelId, progressCallback)
-  }
-
-  /**
    * Initialize the model and vocoder
+   * @returns The initialized LlamaContext
    */
-  async prepare(): Promise<void> {
+  async prepare(): Promise<LlamaContext> {
     if (this.context) {
-      return
-    }
-
-    const modelPath = getModelPath(this.modelId)
-    const exists = await isModelDownloaded(this.modelId)
-
-    if (!exists) {
-      throw new Error(
-        `Model not downloaded. Call download() first. Model ID: ${this.modelId}`
-      )
+      return this.context
     }
 
     this.context = await initLlama({
-      model: modelPath,
+      model: this.modelPath,
       ...this.options.contextParams,
     })
 
@@ -825,6 +980,8 @@ export class LlamaSpeechModel implements SpeechModelV2 {
     if (this.options.vocoderPath) {
       await this.initializeVocoder()
     }
+
+    return this.context
   }
 
   /**
@@ -871,20 +1028,16 @@ export class LlamaSpeechModel implements SpeechModelV2 {
   }
 
   /**
-   * Remove model from disk
+   * Generate speech audio (AI SDK SpeechModelV3)
    */
-  async remove(): Promise<void> {
-    await this.unload()
-    await removeModelFromStorage(this.modelId)
-  }
-
-  /**
-   * Generate speech audio (AI SDK SpeechModelV2)
-   */
-  async doGenerate(options: SpeechModelV2CallOptions) {
+  async doGenerate(options: SpeechModelV3CallOptions) {
     if (!this.context) {
-      throw new Error('Model not prepared. Call prepare() first.')
+      console.warn(
+        '[llama] Model not prepared. Call prepare() ahead of time to optimize performance.'
+      )
     }
+
+    const context = this.context ?? (await this.prepare())
 
     if (!this.vocoderInitialized) {
       throw new Error(
@@ -892,34 +1045,31 @@ export class LlamaSpeechModel implements SpeechModelV2 {
       )
     }
 
-    // Get formatted audio completion prompt
-    const speaker = null // Can be extended to support different speakers
-    const formatted = await this.context.getFormattedAudioCompletion(
+    const speaker = null // todo: extend to support different speakers and settings
+    const formatted = await context.getFormattedAudioCompletion(
       speaker,
       options.text
     )
 
-    // Generate audio tokens via completion
-    const completionResult = await this.context.completion({
+    const guideTokens: number[] = await context.getAudioCompletionGuideTokens(
+      options.text
+    )
+
+    const completionResult = await context.completion({
       prompt: formatted.prompt,
       grammar: formatted.grammar,
+      guide_tokens: guideTokens,
       temperature: 0.8,
-      n_predict: -1,
     })
 
-    if (
-      !completionResult.audio_tokens ||
-      completionResult.audio_tokens.length === 0
-    ) {
+    if (!completionResult.audio_tokens) {
       throw new Error('No audio tokens generated')
     }
 
-    // Decode audio tokens to PCM
-    const audioData = await this.context.decodeAudioTokens(
+    const audioData = await context.decodeAudioTokens(
       completionResult.audio_tokens
     )
 
-    // Convert to Uint8Array
     const audio = new Uint8Array(audioData)
 
     return {
@@ -934,42 +1084,56 @@ export class LlamaSpeechModel implements SpeechModelV2 {
 }
 
 /**
- * Configuration options for llama.rn provider
- */
-export interface LlamaProviderOptions {
-  /** Custom storage path for downloaded models */
-  storagePath?: string
-}
-
-/**
  * Create a llama.rn provider with all model types
  */
-export function createLlamaProvider(providerOptions?: LlamaProviderOptions) {
-  // Set custom storage path if provided
-  if (providerOptions?.storagePath) {
-    setStoragePath(providerOptions.storagePath)
+export function createLlamaProvider() {
+  const provider = function (modelPath: string, options?: LlamaModelOptions) {
+    return provider.languageModel(modelPath, options)
   }
 
-  const provider = function (modelId: string, options?: LlamaModelOptions) {
-    return provider.languageModel(modelId, options)
-  }
-
+  /**
+   * Create a language model instance
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
   provider.languageModel = (
-    modelId: string,
+    modelPath: string,
     options: LlamaModelOptions = {}
   ): LlamaLanguageModel => {
-    return new LlamaLanguageModel(modelId, options)
+    return new LlamaLanguageModel(modelPath, options)
   }
 
+  /**
+   * Create an embedding model instance
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
   provider.textEmbeddingModel = (
-    modelId: string,
+    modelPath: string,
     options: LlamaEmbeddingOptions = {}
   ): LlamaEmbeddingModel => {
-    return new LlamaEmbeddingModel(modelId, options)
+    return new LlamaEmbeddingModel(modelPath, options)
   }
 
+  /**
+   * Create a rerank model instance for document ranking
+   * @param modelPath - Path to a reranker model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options
+   */
+  provider.rerankModel = (
+    modelPath: string,
+    options: LlamaRerankOptions = {}
+  ): LlamaRerankModel => {
+    return new LlamaRerankModel(modelPath, options)
+  }
+
+  /**
+   * Create a speech model instance
+   * @param modelPath - Path to the model file (from downloadModel() or getModelPath())
+   * @param options - Model configuration options (vocoderPath required)
+   */
   provider.speechModel = (
-    modelId: string,
+    modelPath: string,
     options: LlamaSpeechOptions = {}
   ): LlamaSpeechModel => {
     if (!options.vocoderPath) {
@@ -978,7 +1142,7 @@ export function createLlamaProvider(providerOptions?: LlamaProviderOptions) {
           'Provide the path to a vocoder model file.'
       )
     }
-    return new LlamaSpeechModel(modelId, options)
+    return new LlamaSpeechModel(modelPath, options)
   }
 
   provider.imageModel = () => {
